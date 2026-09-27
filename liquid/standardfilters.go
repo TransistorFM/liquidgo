@@ -77,10 +77,24 @@ func (sf *StandardFilters) H(input interface{}) string {
 }
 
 // EscapeOnce escapes a string without changing characters that have already been escaped.
+// escapeOnceEntity matches an already-escaped HTML entity.
+var escapeOnceEntity = regexp.MustCompile(`&(?:[a-zA-Z]+|#[0-9]+|#[xX][0-9a-fA-F]+);`)
+
 func (sf *StandardFilters) EscapeOnce(input interface{}) string {
 	s := ToS(input, nil)
-	// Simple implementation - just escape
-	return html.EscapeString(s)
+
+	// Ruby's escape_once leaves existing entities alone, so "a&amp;b" stays
+	// "a&amp;b" rather than becoming "a&amp;amp;b". Escape the gaps between
+	// entities and copy the entities through untouched.
+	var b strings.Builder
+	last := 0
+	for _, m := range escapeOnceEntity.FindAllStringIndex(s, -1) {
+		b.WriteString(html.EscapeString(s[last:m[0]]))
+		b.WriteString(s[m[0]:m[1]])
+		last = m[1]
+	}
+	b.WriteString(html.EscapeString(s[last:]))
+	return b.String()
 }
 
 // URLEncode converts URL-unsafe characters to percent-encoded equivalent.
@@ -134,6 +148,25 @@ func (sf *StandardFilters) Base64URLSafeDecode(input interface{}) (string, error
 }
 
 // Slice returns a substring or series of array items.
+// sliceBounds resolves Ruby slice semantics, where a negative offset counts
+// back from the end: "hello" | slice: -3, 2 is "ll".
+func sliceBounds(offset, length, size int) (int, int, bool) {
+	if offset < 0 {
+		offset += size
+		if offset < 0 {
+			return 0, 0, false
+		}
+	}
+	if offset >= size || length <= 0 {
+		return 0, 0, false
+	}
+	end := offset + length
+	if end > size {
+		end = size
+	}
+	return offset, end, true
+}
+
 func (sf *StandardFilters) Slice(input interface{}, offset interface{}, length interface{}) interface{} {
 	offsetInt, _ := ToInteger(offset)
 	lengthInt := 1
@@ -143,23 +176,19 @@ func (sf *StandardFilters) Slice(input interface{}, offset interface{}, length i
 
 	switch v := input.(type) {
 	case []interface{}:
-		if offsetInt < 0 || offsetInt >= len(v) {
+		start, end, ok := sliceBounds(offsetInt, lengthInt, len(v))
+		if !ok {
 			return []interface{}{}
 		}
-		end := offsetInt + lengthInt
-		if end > len(v) {
-			end = len(v)
-		}
-		return v[offsetInt:end]
+		return v[start:end]
 	case string:
-		if offsetInt < 0 || offsetInt >= len(v) {
+		// Ruby slices by character, not byte.
+		runes := []rune(v)
+		start, end, ok := sliceBounds(offsetInt, lengthInt, len(runes))
+		if !ok {
 			return ""
 		}
-		end := offsetInt + lengthInt
-		if end > len(v) {
-			end = len(v)
-		}
-		return v[offsetInt:end]
+		return string(runes[start:end])
 	default:
 		// Use reflection to handle typed slices/arrays
 		if input != nil {
@@ -200,16 +229,19 @@ func (sf *StandardFilters) Truncate(input interface{}, length interface{}, trunc
 		truncateStr = ToS(truncateString, nil)
 	}
 
-	if len(inputStr) <= lengthInt {
+	// Ruby counts characters, not bytes, so a multi-byte ellipsis or any
+	// non-ASCII text would otherwise truncate far too aggressively.
+	runes := []rune(inputStr)
+	if len(runes) <= lengthInt {
 		return inputStr
 	}
 
-	l := lengthInt - len(truncateStr)
+	l := lengthInt - len([]rune(truncateStr))
 	if l < 0 {
 		l = 0
 	}
 
-	return inputStr[:l] + truncateStr
+	return string(runes[:l]) + truncateStr
 }
 
 // TruncateWords truncates a string down to a given number of words.
@@ -241,7 +273,14 @@ func (sf *StandardFilters) TruncateWords(input interface{}, words interface{}, t
 func (sf *StandardFilters) Split(input interface{}, pattern interface{}) []interface{} {
 	inputStr := ToS(input, nil)
 	patternStr := ToS(pattern, nil)
+	if inputStr == "" {
+		return []interface{}{}
+	}
 	parts := strings.Split(inputStr, patternStr)
+	// Ruby's String#split drops trailing empty strings.
+	for len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
 	result := make([]interface{}, len(parts))
 	for i, part := range parts {
 		result[i] = part
@@ -450,17 +489,23 @@ func (sf *StandardFilters) Prepend(input interface{}, str interface{}) string {
 // Mirrors Ruby's abs from standardfilters.rb:792
 func (sf *StandardFilters) Abs(input interface{}) interface{} {
 	num, _ := ToNumber(input)
-	switch v := num.(type) {
-	case int:
-		if v < 0 {
-			return -v
+	f, ok := num.(float64)
+	if !ok {
+		if i, isInt := num.(int); isInt {
+			if i < 0 {
+				return -i
+			}
+			return i
 		}
-		return v
-	case float64:
-		return math.Abs(v)
-	default:
 		return 0
 	}
+
+	// ToNumber normalises to float64, so integer-ness comes from the input.
+	// Ruby: -5 | abs => 5 (Integer), -5.5 | abs => 5.5 (Float).
+	if isIntLike(input) {
+		return int(math.Abs(f))
+	}
+	return math.Abs(f)
 }
 
 // Plus adds two numbers.
@@ -946,6 +991,24 @@ func nilSafeCasecmp(a, b interface{}) int {
 
 // applyOperation applies a math operation to two numbers.
 // Mirrors Ruby's apply_operation from standardfilters.rb:1003-1006
+// isIntLike reports whether a value is a Ruby Integer for arithmetic purposes.
+func isIntLike(v interface{}) bool {
+	switch n := v.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case float32, float64:
+		return false
+	case string:
+		trimmed := strings.TrimSpace(n)
+		if trimmed == "" {
+			return false
+		}
+		_, err := strconv.Atoi(trimmed)
+		return err == nil
+	}
+	return false
+}
+
 func applyOperation(input, operand interface{}, operation string) interface{} {
 	inputNum, _ := ToNumber(input)
 	operandNum, _ := ToNumber(operand)
@@ -972,9 +1035,12 @@ func applyOperation(input, operand interface{}, operation string) interface{} {
 		operandFloat = 0
 	}
 
-	// Determine if we should return int or float
-	_, inputIsInt := inputNum.(int)
-	_, operandIsInt := operandNum.(int)
+	// ToNumber normalises everything to float64, so integer-ness has to come
+	// from the original values (Ruby: Integer op Integer => Integer, any Float
+	// => Float). This matters for rendering too, since Ruby prints a Float as
+	// "6.0" but an Integer as "6".
+	inputIsInt := isIntLike(input)
+	operandIsInt := isIntLike(operand)
 
 	switch operation {
 	case "+":
@@ -988,9 +1054,9 @@ func applyOperation(input, operand interface{}, operation string) interface{} {
 			return 0 // Handle division by zero
 		}
 		result = inputFloat / operandFloat
-		// For division, if operand is int, result should be int
+		// Ruby's Integer#/ floors toward negative infinity.
 		if operandIsInt && inputIsInt {
-			return int(inputFloat / operandFloat)
+			return int(math.Floor(inputFloat / operandFloat))
 		}
 	case "%":
 		if operandFloat == 0 {
@@ -1431,11 +1497,10 @@ func (sf *StandardFilters) Sum(input interface{}, property interface{}) interfac
 		// Sum items directly
 		iter.Each(func(item interface{}) {
 			num, _ := ToNumber(item)
-			switch v := num.(type) {
-			case int:
-				sum += float64(v)
-			case float64:
-				sum += v
+			if f, ok := num.(float64); ok {
+				sum += f
+			}
+			if !isIntLike(item) {
 				hasFloat = true
 			}
 		})
@@ -1453,11 +1518,10 @@ func (sf *StandardFilters) Sum(input interface{}, property interface{}) interfac
 			}
 
 			num, _ := ToNumber(val)
-			switch v := num.(type) {
-			case int:
-				sum += float64(v)
-			case float64:
-				sum += v
+			if f, ok := num.(float64); ok {
+				sum += f
+			}
+			if !isIntLike(val) {
 				hasFloat = true
 			}
 		})

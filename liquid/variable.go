@@ -209,11 +209,12 @@ func (v *Variable) strictParse(markup string) error {
 		if err != nil {
 			return err
 		}
-		var filterArgs []string
+		filterArgs := []string{}
 		if _, ok := p.ConsumeOptional(":colon"); ok {
-			filterArgs = v.parseFilterArgs(p)
-		} else {
-			filterArgs = []string{}
+			filterArgs, err = v.parseFilterArgs(p)
+			if err != nil {
+				return err
+			}
 		}
 		v.filters = append(v.filters, v.laxParseFilterExpressions(filterName, filterArgs))
 	}
@@ -250,23 +251,26 @@ func (v *Variable) rigidParse(markup string) error {
 	return nil
 }
 
-func (v *Variable) parseFilterArgs(p *Parser) []string {
+// parseFilterArgs reads the arguments after a filter's colon. Argument errors
+// are returned rather than swallowed: a colon or comma promises an argument, and
+// Ruby raises "[:end_of_string] is not a valid expression" when none follows.
+func (v *Variable) parseFilterArgs(p *Parser) ([]string, error) {
 	arg, err := p.Argument()
 	if err != nil {
-		return []string{}
+		return nil, err
 	}
 	filterArgs := []string{arg}
 	for {
-		_, ok := p.ConsumeOptional(":comma")
-		if !ok {
+		if _, ok := p.ConsumeOptional(":comma"); !ok {
 			break
 		}
 		arg, err := p.Argument()
-		if err == nil {
-			filterArgs = append(filterArgs, arg)
+		if err != nil {
+			return nil, err
 		}
+		filterArgs = append(filterArgs, arg)
 	}
-	return filterArgs
+	return filterArgs, nil
 }
 
 func (v *Variable) laxParseFilterExpressions(filterName string, unparsedArgs []string) []interface{} {
@@ -298,18 +302,16 @@ func (v *Variable) rigidParseFilterExpressions(p *Parser) []interface{} {
 	keywordArgs := make(map[string]interface{})
 
 	if _, ok := p.ConsumeOptional(":colon"); ok {
-		// Parse first argument (no leading comma)
-		if !v.endOfArguments(p) {
-			v.argument(p, &filterArgs, keywordArgs)
-		}
+		// A colon promises an argument. Ruby raises here rather than accepting
+		// `| truncate:` or a trailing comma, so strict mode must too.
+		v.requireArgument(p, &filterArgs, keywordArgs)
 
 		// Parse remaining arguments (with leading commas)
 		for {
-			_, ok := p.ConsumeOptional(":comma")
-			if !ok || v.endOfArguments(p) {
+			if _, ok := p.ConsumeOptional(":comma"); !ok {
 				break
 			}
-			v.argument(p, &filterArgs, keywordArgs)
+			v.requireArgument(p, &filterArgs, keywordArgs)
 		}
 	}
 
@@ -318,6 +320,15 @@ func (v *Variable) rigidParseFilterExpressions(p *Parser) []interface{} {
 		result = append(result, keywordArgs)
 	}
 	return result
+}
+
+// requireArgument parses one filter argument, raising if none is present.
+// Mirrors Ruby's Parser#argument, which rejects [:end_of_string].
+func (v *Variable) requireArgument(p *Parser, positionalArgs *[]interface{}, keywordArgs map[string]interface{}) {
+	if v.endOfArguments(p) {
+		panic(NewSyntaxError("[:end_of_string] is not a valid expression"))
+	}
+	v.argument(p, positionalArgs, keywordArgs)
 }
 
 func (v *Variable) argument(p *Parser, positionalArgs *[]interface{}, keywordArgs map[string]interface{}) {
@@ -370,6 +381,17 @@ func (v *Variable) Render(context TagContext) interface{} {
 			evaluatedArgs[i] = context.Evaluate(arg)
 		}
 
+		// Ruby appends evaluated keyword args as a final positional hash.
+		if len(filter) > 2 {
+			if kwargs, ok := filter[2].(map[string]interface{}); ok && len(kwargs) > 0 {
+				evaluated := make(map[string]interface{}, len(kwargs))
+				for k, arg := range kwargs {
+					evaluated[k] = context.Evaluate(arg)
+				}
+				evaluatedArgs = append(evaluatedArgs, evaluated)
+			}
+		}
+
 		// Invoke filter
 		value = context.Invoke(filterName, value, evaluatedArgs...)
 	}
@@ -417,6 +439,16 @@ func (v *Variable) RenderToOutputBuffer(context TagContext, output *string) {
 	}()
 
 	val := v.Render(context)
+
+	// Liquid writes arrays by joining their elements with no separator, so
+	// {{ nums }} is "123", not "[1, 2, 3]".
+	if arr, ok := val.([]interface{}); ok {
+		for _, item := range arr {
+			*output += ToS(item, nil)
+		}
+		return
+	}
+
 	*output += ToS(val, nil)
 }
 

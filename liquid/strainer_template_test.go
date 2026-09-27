@@ -1,6 +1,7 @@
 package liquid
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -206,5 +207,65 @@ func TestStrainerTemplateInvokeErrorHandling(t *testing.T) {
 	}
 	if result != "arg" {
 		t.Errorf("Expected 'arg' in non-strict mode, got %v", result)
+	}
+}
+
+type localeFilter struct{ locale string }
+
+func (f *localeFilter) WithContext(ctx *Context) interface{} {
+	locale, _ := ctx.Registers().Get("locale").(string)
+	return &localeFilter{locale: locale}
+}
+
+func (f *localeFilter) Greet(input interface{}) string {
+	return f.locale + ":" + ToS(input, nil)
+}
+
+func TestContextualFilterSeesRenderRegisters(t *testing.T) {
+	env := NewEnvironment()
+	if err := env.RegisterFilter(&localeFilter{}); err != nil {
+		t.Fatal(err)
+	}
+
+	tmpl, err := ParseTemplate(`{{ "hi" | greet }}`, &TemplateOptions{Environment: env})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, locale := range []string{"en", "fr"} {
+		got := tmpl.Render(nil, &RenderOptions{Registers: map[string]interface{}{"locale": locale}})
+		if got != locale+":hi" {
+			t.Errorf("locale %s: got %q", locale, got)
+		}
+	}
+}
+
+type failingFilter struct{}
+
+func (f *failingFilter) Explode(input interface{}) (string, error) {
+	return "", NewArgumentError("bad input")
+}
+
+func (f *failingFilter) Internal(input interface{}) (string, error) {
+	return "", fmt.Errorf("boom")
+}
+
+func TestFilterErrorsRenderAsLiquidErrors(t *testing.T) {
+	env := NewEnvironment()
+	if err := env.RegisterFilter(&failingFilter{}); err != nil {
+		t.Fatal(err)
+	}
+
+	for src, want := range map[string]string{
+		`a{{ 1 | explode }}b`:  "aLiquid error: bad inputb",
+		`a{{ 1 | internal }}b`: "aLiquid error: internalb",
+	} {
+		tmpl, err := ParseTemplate(src, &TemplateOptions{Environment: env})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := tmpl.Render(nil, nil); got != want {
+			t.Errorf("%s: got %q, want %q", src, got, want)
+		}
 	}
 }

@@ -282,7 +282,7 @@ func (c *CaseTag) RenderToOutputBuffer(context liquid.TagContext, output *string
 		}
 
 		resultVal := liquid.ToLiquidValue(result)
-		if resultVal != nil && resultVal != false && resultVal != "" {
+		if liquid.IsTruthy(resultVal) {
 			if attachment, ok := block.Attachment().(*liquid.BlockBody); ok {
 				attachment.RenderToOutputBuffer(context, output)
 			}
@@ -291,7 +291,15 @@ func (c *CaseTag) RenderToOutputBuffer(context liquid.TagContext, output *string
 	}
 }
 
-// Blank returns true if all blocks are blank.
+// Blank returns true if all when/else block bodies are blank.
+// Ruby: @blocks.none? { |block| !block.attachment.blank? }
 func (c *CaseTag) Blank() bool {
-	return c.Block.Blank()
+	for _, block := range c.blocks {
+		if attachment, ok := block.Attachment().(interface{ Blank() bool }); ok {
+			if !attachment.Blank() {
+				return false
+			}
+		}
+	}
+	return true
 }

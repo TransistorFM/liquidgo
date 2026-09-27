@@ -108,11 +108,11 @@ func (c *Condition) Evaluate(context ConditionContext) (bool, error) {
 		shouldContinue := false
 		switch condition.childRelation {
 		case "or":
-			if resultVal == nil || resultVal == false || resultVal == "" {
+			if !IsTruthy(resultVal) {
 				shouldContinue = true
 			}
 		case "and":
-			if resultVal != nil && resultVal != false && resultVal != "" {
+			if IsTruthy(resultVal) {
 				shouldContinue = true
 			}
 		}
@@ -132,7 +132,7 @@ func (c *Condition) interpretCondition(left, right interface{}, op string, conte
 		result := context.Evaluate(left)
 		resultVal := ToLiquidValue(result)
 		// Convert to bool
-		if resultVal == nil || resultVal == false || resultVal == "" {
+		if !IsTruthy(resultVal) {
 			return false, nil
 		}
 		return true, nil
@@ -225,7 +225,55 @@ func (c *Condition) equalVariables(left, right interface{}) bool {
 		return checkMethodLiteral(ml, left)
 	}
 
+	// Ruby compares numerics across Integer/Float (1 == 1.0), Go's == does not.
+	if lf, lok := numericValue(left); lok {
+		if rf, rok := numericValue(right); rok {
+			return lf == rf
+		}
+	}
+
 	return left == right
+}
+
+// IsTruthy reports Ruby truthiness: only nil and false are falsy. Empty
+// strings, 0 and empty arrays are all truthy in Ruby, unlike in many languages.
+func IsTruthy(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	b, isBool := v.(bool)
+	return !isBool || b
+}
+
+// numericValue returns the float value of any Go numeric type.
+func numericValue(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case float32:
+		return float64(n), true
+	case float64:
+		return n, true
+	}
+	return 0, false
 }
 
 func checkMethodLiteral(ml *MethodLiteral, obj interface{}) bool {
@@ -342,6 +390,20 @@ func toNumber(v interface{}) (float64, bool) {
 	return 0, false
 }
 
+// itemContains reports whether an array element satisfies `contains`.
+//
+// Ruby's Array#include? is exact equality, so a string element must match
+// exactly: ["about-us"] contains "about" is false. Non-string elements (structs
+// and drops) keep this package's substring match over their rendered form,
+// which lets `posts contains "Alice"` find a field value.
+func itemContains(item interface{}, rightStr string) bool {
+	itemStr := ToS(item, nil)
+	if _, isString := item.(string); isString {
+		return itemStr == rightStr
+	}
+	return itemStr == rightStr || strings.Contains(itemStr, rightStr)
+}
+
 func containsOperator(left, right interface{}) bool {
 	if left == nil || right == nil {
 		return false
@@ -357,9 +419,7 @@ func containsOperator(left, right interface{}) bool {
 	// Check if left is a slice/array
 	if arr, ok := left.([]interface{}); ok {
 		for _, item := range arr {
-			itemStr := ToS(item, nil)
-			// Check for exact match or substring match
-			if itemStr == rightStr || strings.Contains(itemStr, rightStr) {
+			if itemContains(item, rightStr) {
 				return true
 			}
 		}
@@ -369,10 +429,7 @@ func containsOperator(left, right interface{}) bool {
 		v := reflect.ValueOf(left)
 		if v.Kind() == reflect.Slice || v.Kind() == reflect.Array {
 			for i := 0; i < v.Len(); i++ {
-				item := v.Index(i).Interface()
-				itemStr := ToS(item, nil)
-				// Check for exact match or substring match
-				if itemStr == rightStr || strings.Contains(itemStr, rightStr) {
+				if itemContains(v.Index(i).Interface(), rightStr) {
 					return true
 				}
 			}

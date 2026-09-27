@@ -2,8 +2,10 @@ package liquid
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +77,13 @@ func sliceCollectionUsingEach(collection interface{}, from int, to *int) []inter
 
 	// Use reflection to iterate
 	v := reflect.ValueOf(collection)
+
+	// Ruby iterates a Hash as [key, value] pairs. Returning an empty segment
+	// here made `{% for pair in hash %}` render nothing at all, silently.
+	if v.Kind() == reflect.Map {
+		return sliceMapUsingKeys(collection, v, from, to)
+	}
+
 	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
 		return []interface{}{}
 	}
@@ -90,6 +99,45 @@ func sliceCollectionUsingEach(collection interface{}, from int, to *int) []inter
 		}
 
 		index++
+	}
+
+	return segments
+}
+
+// OrderedKeys lets a map-like value declare its iteration order. Ruby hashes
+// iterate in insertion order; Go maps are deliberately randomised, so a value
+// that cares about matching Ruby has to say what the order is. Without it, keys
+// are sorted so output is at least deterministic.
+type OrderedKeys interface {
+	OrderedKeys() []string
+}
+
+func sliceMapUsingKeys(collection interface{}, v reflect.Value, from int, to *int) []interface{} {
+	var keys []string
+	if ordered, ok := collection.(OrderedKeys); ok {
+		keys = ordered.OrderedKeys()
+	} else {
+		for _, k := range v.MapKeys() {
+			keys = append(keys, ToS(k.Interface(), nil))
+		}
+		sort.Strings(keys)
+	}
+
+	segments := []interface{}{}
+	for index, key := range keys {
+		if to != nil && *to <= index {
+			break
+		}
+		if from > index {
+			continue
+		}
+
+		value := v.MapIndex(reflect.ValueOf(key))
+		if !value.IsValid() {
+			continue
+		}
+		// Ruby yields a two-element [key, value] array per entry.
+		segments = append(segments, []interface{}{key, value.Interface()})
 	}
 
 	return segments
@@ -229,6 +277,18 @@ func ToDate(obj interface{}) *time.Time {
 				time.RFC1123Z,
 				"2006-01-02",
 				"2006-01-02 15:04:05",
+				// Ruby Time#to_s / ActiveSupport TimeWithZone#to_s
+				"2006-01-02 15:04:05 -0700",
+				"2006-01-02 15:04:05 -07:00",
+				"2006-01-02 15:04:05 MST",
+				"2006-01-02T15:04:05",
+				"2006/01/02 15:04:05",
+				"2006/01/02",
+				time.RFC822,
+				time.RFC822Z,
+				time.ANSIC,
+				time.UnixDate,
+				time.RubyDate,
 			}
 			for _, format := range formats {
 				if t, err := time.Parse(format, v); err == nil {
@@ -265,6 +325,48 @@ func ToLiquidValue(obj interface{}) interface{} {
 
 // ToS converts an object to a string representation.
 // Optimization: Fast path for common types to enable compiler inlining.
+// RubyFloatToS renders a float the way Ruby's Float#to_s does: always with a
+// decimal point ("9.0", not "9"), switching to exponential form when the
+// decimal exponent is >= 15 or <= -5, with a two-digit padded exponent
+// ("1.0e+15", "1.0e-05"). Verified against Ruby 3.x / liquid 5.13.0.
+func RubyFloatToS(f float64) string {
+	if math.IsNaN(f) {
+		return "NaN"
+	}
+	if math.IsInf(f, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(f, -1) {
+		return "-Infinity"
+	}
+
+	// Shortest round-tripping form, to read off the decimal exponent.
+	sci := strconv.FormatFloat(f, 'e', -1, 64)
+	mantissa, expPart, _ := strings.Cut(sci, "e")
+	exp, err := strconv.Atoi(expPart)
+	if err != nil {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+
+	if exp >= 15 || exp <= -5 {
+		if !strings.Contains(mantissa, ".") {
+			mantissa += ".0"
+		}
+		sign := "+"
+		if exp < 0 {
+			sign = "-"
+			exp = -exp
+		}
+		return fmt.Sprintf("%se%s%02d", mantissa, sign, exp)
+	}
+
+	out := strconv.FormatFloat(f, 'f', -1, 64)
+	if !strings.Contains(out, ".") {
+		out += ".0"
+	}
+	return out
+}
+
 func ToS(obj interface{}, seen map[uintptr]bool) string {
 	// Handle nil - in Liquid, nil renders as empty string (like Ruby's nil.to_s)
 	if obj == nil {
@@ -283,7 +385,9 @@ func ToS(obj interface{}, seen map[uintptr]bool) string {
 		}
 		return "false"
 	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
+		return RubyFloatToS(v)
+	case float32:
+		return RubyFloatToS(float64(v))
 	case map[string]interface{}:
 		if seen == nil {
 			seen = make(map[uintptr]bool)

@@ -62,7 +62,7 @@ func (u *UnlessTag) RenderToOutputBuffer(context liquid.TagContext, output *stri
 			shouldRender = (resultVal == nil || resultVal == false || resultVal == "")
 		} else {
 			// Elsif/else blocks: render if condition is true
-			shouldRender = (resultVal != nil && resultVal != false && resultVal != "")
+			shouldRender = liquid.IsTruthy(resultVal)
 		}
 
 		if shouldRender {

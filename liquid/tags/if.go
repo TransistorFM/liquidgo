@@ -226,7 +226,7 @@ func (i *IfTag) RenderToOutputBuffer(context liquid.TagContext, output *string) 
 		resultVal := liquid.ToLiquidValue(result)
 
 		// Check if condition is true
-		if resultVal != nil && resultVal != false && resultVal != "" {
+		if liquid.IsTruthy(resultVal) {
 			// Render the attachment
 			if attachment, ok := block.Attachment().(*liquid.BlockBody); ok {
 				attachment.RenderToOutputBuffer(context, output)

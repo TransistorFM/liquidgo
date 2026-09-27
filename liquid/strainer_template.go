@@ -96,12 +96,30 @@ func NewStrainerTemplate(class *StrainerTemplateClass, context interface{ Contex
 	return st
 }
 
+var errorInterface = reflect.TypeOf((*error)(nil)).Elem()
+
+// ContextualFilter is implemented by filters that need the render context,
+// as Ruby filters read @context (registers, environments). WithContext is called
+// once per render and returns the instance to use for it; it must return the
+// same pointer type as the registered filter.
+type ContextualFilter interface {
+	WithContext(ctx *Context) interface{}
+}
+
 // NewStrainerTemplateWithFilters creates a new strainer template instance with additional filters.
 func NewStrainerTemplateWithFilters(class *StrainerTemplateClass, context interface{ Context() interface{} }, strictFilters bool, filters []interface{}) *StrainerTemplate {
 	st := NewStrainerTemplate(class, context, strictFilters)
 
+	var ctx *Context
+	if context != nil {
+		ctx, _ = context.Context().(*Context)
+	}
+
 	// Add additional filter instances
 	for _, filter := range filters {
+		if cf, ok := filter.(ContextualFilter); ok && ctx != nil {
+			filter = cf.WithContext(ctx)
+		}
 		filterType := reflect.TypeOf(filter)
 		if filterType.Kind() == reflect.Ptr {
 			st.filterInstances[filterType.String()] = filter
@@ -231,6 +249,11 @@ func (st *StrainerTemplate) Invoke(method string, args ...interface{}) (interfac
 		// Call the method - use Call for both variadic and non-variadic
 		// Go's reflect.Call handles variadic functions automatically
 		results := methodValue.Call(callArgs)
+		// A filter that returns an error raises it, as a Ruby filter would;
+		// rendering turns it into "Liquid error: ...".
+		if n := len(results); n > 1 && results[n-1].Type().Implements(errorInterface) && !results[n-1].IsNil() {
+			panic(results[n-1].Interface().(error))
+		}
 		if len(results) > 0 {
 			return results[0].Interface(), nil
 		}
