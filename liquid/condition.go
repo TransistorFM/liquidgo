@@ -1,6 +1,7 @@
 package liquid
 
 import (
+	"math"
 	"reflect"
 	"strings"
 )
@@ -217,22 +218,77 @@ func getConditionOperator(op string) ConditionOperator {
 }
 
 func (c *Condition) equalVariables(left, right interface{}) bool {
-	if ml, ok := left.(*MethodLiteral); ok {
-		return checkMethodLiteral(ml, right)
+	type collectionPair struct {
+		left, right         uintptr
+		leftType, rightType reflect.Type
+		length              int
 	}
-
-	if ml, ok := right.(*MethodLiteral); ok {
-		return checkMethodLiteral(ml, left)
-	}
-
-	// Ruby compares numerics across Integer/Float (1 == 1.0), Go's == does not.
-	if lf, lok := numericValue(left); lok {
-		if rf, rok := numericValue(right); rok {
-			return lf == rf
+	seen := make(map[collectionPair]bool)
+	var equal func(interface{}, interface{}) bool
+	equal = func(left, right interface{}) bool {
+		if ml, ok := left.(*MethodLiteral); ok {
+			return checkMethodLiteral(ml, right)
 		}
-	}
 
-	return left == right
+		if ml, ok := right.(*MethodLiteral); ok {
+			return checkMethodLiteral(ml, left)
+		}
+
+		if same, numeric := equalNumbers(left, right); numeric {
+			return same
+		}
+
+		if left == nil || right == nil {
+			return left == nil && right == nil
+		}
+
+		// Only collections compare structurally; objects like Drops retain identity.
+		lv, rv := reflect.ValueOf(left), reflect.ValueOf(right)
+		switch lv.Kind() {
+		case reflect.Slice, reflect.Array:
+			if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+				return false
+			}
+		case reflect.Map:
+			if rv.Kind() != reflect.Map || lv.Type().Key() != rv.Type().Key() {
+				return false
+			}
+		default:
+			return left == right
+		}
+		if lv.Len() != rv.Len() {
+			return false
+		}
+
+		// Revisited pairs close a cycle. Continue comparing the other values so
+		// equal cycles cannot hide unequal leaves. Slice length is part of identity.
+		if lv.Kind() != reflect.Array && rv.Kind() != reflect.Array {
+			pair := collectionPair{lv.Pointer(), rv.Pointer(), lv.Type(), rv.Type(), lv.Len()}
+			if seen[pair] {
+				return true
+			}
+			seen[pair] = true
+		}
+
+		if lv.Kind() == reflect.Map {
+			iter := lv.MapRange()
+			for iter.Next() {
+				// Hash keys use exact key matching, not cross-type numeric equality.
+				value := rv.MapIndex(iter.Key())
+				if !value.IsValid() || !equal(iter.Value().Interface(), value.Interface()) {
+					return false
+				}
+			}
+		} else {
+			for i := 0; i < lv.Len(); i++ {
+				if !equal(lv.Index(i).Interface(), rv.Index(i).Interface()) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return equal(left, right)
 }
 
 // IsTruthy reports Ruby truthiness: only nil and false are falsy. Empty
@@ -245,35 +301,33 @@ func IsTruthy(v interface{}) bool {
 	return !isBool || b
 }
 
-// numericValue returns the float value of any Go numeric type.
-func numericValue(v interface{}) (float64, bool) {
-	switch n := v.(type) {
-	case int:
-		return float64(n), true
-	case int8:
-		return float64(n), true
-	case int16:
-		return float64(n), true
-	case int32:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case uint:
-		return float64(n), true
-	case uint8:
-		return float64(n), true
-	case uint16:
-		return float64(n), true
-	case uint32:
-		return float64(n), true
-	case uint64:
-		return float64(n), true
-	case float32:
-		return float64(n), true
-	case float64:
-		return n, true
+// equalNumbers returns equality and whether both operands are numeric. Compare
+// integers exactly; for Integer/Float equality the Float must be an exact integer
+// in range, rather than rounding the Integer to float64 (which loses bits > 2^53).
+func equalNumbers(left, right interface{}) (bool, bool) {
+	lv, rv := reflect.ValueOf(left), reflect.ValueOf(right)
+	if lv.CanFloat() {
+		lv, rv = rv, lv
 	}
-	return 0, false
+	switch {
+	case lv.CanInt() && rv.CanInt():
+		return lv.Int() == rv.Int(), true
+	case lv.CanUint() && rv.CanUint():
+		return lv.Uint() == rv.Uint(), true
+	case lv.CanInt() && rv.CanUint():
+		return lv.Int() >= 0 && uint64(lv.Int()) == rv.Uint(), true
+	case lv.CanUint() && rv.CanInt():
+		return rv.Int() >= 0 && lv.Uint() == uint64(rv.Int()), true
+	case lv.CanInt() && rv.CanFloat():
+		f := rv.Float()
+		return f >= -0x1p63 && f < 0x1p63 && math.Trunc(f) == f && int64(f) == lv.Int(), true
+	case lv.CanUint() && rv.CanFloat():
+		f := rv.Float()
+		return f >= 0 && f < 0x1p64 && math.Trunc(f) == f && uint64(f) == lv.Uint(), true
+	case lv.CanFloat() && rv.CanFloat():
+		return lv.Float() == rv.Float(), true
+	}
+	return false, false
 }
 
 func checkMethodLiteral(ml *MethodLiteral, obj interface{}) bool {
